@@ -4,12 +4,13 @@ use libc::{c_int, c_void, iovec, pid_t, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_SE
 use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::fs::File;
 use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
+use std::time::{Duration, Instant};
 
 use crate::types::{UserFpRegs, UserRegs};
 use crate::{log_info, log_success, log_warn};
@@ -102,12 +103,27 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     match ptrace::attach(target_pid) {
         Ok(_) => {
             log_success!("成功附加到进程 {}，等待 SIGSTOP...", pid);
-            match waitpid(target_pid, None) {
-                Ok(WaitStatus::Stopped(_, _)) => {
-                    log_success!("进程已停止，可以操作寄存器");
-                    Ok(())
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                match waitpid(target_pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::__WALL)) {
+                    Ok(WaitStatus::Stopped(_, sig)) => {
+                        log_success!("进程已停止，可以操作寄存器 (signal={:?})", sig);
+                        return Ok(());
+                    }
+                    Ok(WaitStatus::StillAlive) => {
+                        if Instant::now() >= deadline {
+                            let status = std::fs::read_to_string(format!("/proc/{}/status", pid))
+                                .unwrap_or_else(|_| "<status-unavailable>".to_string());
+                            return Err(format!(
+                                "等待 SIGSTOP 超时: /proc/{}/status=\n{}",
+                                pid, status
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(other) => return Err(format!("waitpid 状态异常: {:?}", other)),
+                    Err(errno) => return Err(format!("waitpid 失败: {}", errno)),
                 }
-                other => Err(format!("waitpid 状态异常: {:?}", other)),
             }
         }
         Err(errno) => {

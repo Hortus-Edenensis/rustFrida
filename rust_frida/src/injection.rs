@@ -154,6 +154,7 @@ fn find_data_dir_by_uid(uid: u32) -> Option<String> {
 }
 
 /// 使用 eBPF 监听 SO 加载并自动附加
+#[cfg(feature = "watch-so")]
 pub(crate) fn watch_and_inject(
     so_pattern: &str,
     timeout_secs: Option<u64>,
@@ -220,6 +221,15 @@ pub(crate) fn watch_and_inject(
         }
         None => Err("监听超时，未检测到匹配的 SO 加载".to_string()),
     }
+}
+
+#[cfg(not(feature = "watch-so"))]
+pub(crate) fn watch_and_inject(
+    _so_pattern: &str,
+    _timeout_secs: Option<u64>,
+    _string_overrides: &std::collections::HashMap<String, String>,
+) -> Result<RawFd, String> {
+    Err("当前构建未启用 --watch-so（ldmonitor/eBPF）功能；请改用 --pid/--name/--spawn，或用 --features watch-so 重新构建".to_string())
 }
 
 // =============================================================================
@@ -416,6 +426,46 @@ fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn try_read_loader_status(ctrl_fd: RawFd, timeout_ms: i32) -> Option<Result<(), String>> {
+    let mut pfd = libc::pollfd {
+        fd: ctrl_fd,
+        events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc <= 0 {
+        return None;
+    }
+
+    let mut msg_type = [0u8; 1];
+    if recv_exact(ctrl_fd, &mut msg_type).is_err() {
+        return None;
+    }
+
+    match msg_type[0] {
+        t if t == message_type::READY => Some(Ok(())),
+        t if t == message_type::ERROR_DLOPEN || t == message_type::ERROR_DLSYM => {
+            let mut len_buf = [0u8; 2];
+            if let Err(e) = recv_exact(ctrl_fd, &mut len_buf) {
+                return Some(Err(format!("Loader 错误帧损坏: {}", e)));
+            }
+            let msg_len = u16::from_le_bytes(len_buf) as usize;
+            let mut msg_buf = vec![0u8; msg_len];
+            if let Err(e) = recv_exact(ctrl_fd, &mut msg_buf) {
+                return Some(Err(format!("Loader 错误消息读取失败: {}", e)));
+            }
+            let kind = if t == message_type::ERROR_DLOPEN {
+                "dlopen"
+            } else {
+                "dlsym"
+            };
+            let msg = String::from_utf8_lossy(&msg_buf);
+            Some(Err(format!("Loader {} 失败: {}", kind, msg)))
+        }
+        other => Some(Err(format!("Loader 提前返回未知消息: {}", other))),
+    }
+}
+
 /// Host 端执行 loader IPC 握手协议
 /// 返回 REPL 用的 host_fd
 fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String> {
@@ -468,7 +518,18 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
     let agent_repl_fd = sv[1];
     // 注意：socketpair 在 sockfs 上，不支持 fsetxattr relabel（associate 被拒），
     // 但 Unix socket fd 的 SCM_RIGHTS 传递不受 MLS file 检查约束，无需 relabel
-    send_fd(ctrl_fd, agent_repl_fd)?;
+    if let Err(e) = send_fd(ctrl_fd, agent_repl_fd) {
+        unsafe {
+            close(agent_repl_fd);
+            close(host_repl_fd);
+        }
+        if e.contains("Broken pipe") {
+            if let Some(status) = try_read_loader_status(ctrl_fd, 200) {
+                return status.map(|_| unreachable!("READY before REPL fd is not expected"));
+            }
+        }
+        return Err(e);
+    }
     unsafe { close(agent_repl_fd) };
     log_verbose!("REPL socketpair fd 已发送");
 

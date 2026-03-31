@@ -15,6 +15,7 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <link.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -60,7 +61,7 @@ typedef struct {
   uint64_t string_table_addr;  /* Remote StringTable address for agent */
 
   /* Runtime state (filled by loader) */
-  void * worker;               /* pthread_t */
+  pthread_t worker;
   void * agent_handle;
   void * agent_entrypoint_impl;
 } RustFridaLoaderContext;

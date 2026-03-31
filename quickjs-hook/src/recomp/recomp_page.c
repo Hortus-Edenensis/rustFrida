@@ -9,6 +9,7 @@
 #include "../arm64_writer.h"
 #include "../arm64_relocator.h"
 #include "../arm64_common.h"
+#include "../hook_engine_internal.h"
 #include <string.h>
 #include <stdio.h>
 
